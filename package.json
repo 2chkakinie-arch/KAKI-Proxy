@@ -1,0 +1,20 @@
+{
+  "name": "kaki-proxy",
+  "version": "1.0.0",
+  "description": "KAKI Proxy — World-class YouTube-only streaming unblocker. Encrypted URL rewriting, Range-aware streaming, anti-bot bypass via server-side fetch.",
+  "main": "index.js",
+  "type": "commonjs",
+  "scripts": {
+    "start": "node index.js",
+    "dev": "node index.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "express": "^4.19.2",
+    "undici": "^6.19.8",
+    "compression": "^1.7.4"
+  },
+  "license": "MIT"
+}
