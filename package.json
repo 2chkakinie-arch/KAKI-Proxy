@@ -1,15 +1,17 @@
 {
   "name": "yt-stream-api",
   "version": "1.0.0",
-  "description": "YouTube googlevideo raw stream URL extractor API - Pure original implementation",
+  "description": "YouTube googlevideo raw stream URL extraction API (Express)",
   "main": "index.js",
+  "type": "commonjs",
   "scripts": {
     "start": "node index.js",
     "dev": "node index.js"
   },
-  "engines": {
-    "node": ">=18.0.0"
-  },
-  "dependencies": {},
-  "license": "MIT"
+  "engines": { "node": ">=18.0.0" },
+  "dependencies": {
+    "express": "^4.19.2",
+    "youtubei.js": "^13.4.0",
+    "undici": "^6.19.8"
+  }
 }
