@@ -1,0 +1,15 @@
+services:
+  - type: web
+    name: yt-stream-api
+    runtime: node
+    plan: free
+    region: oregon
+    buildCommand: echo 'no build step required (zero deps)'
+    startCommand: node index.js
+    healthCheckPath: /health
+    envVars:
+      - key: NODE_VERSION
+        value: 20.11.0
+      - key: PORT
+        value: 10000
+    autoDeploy: true
