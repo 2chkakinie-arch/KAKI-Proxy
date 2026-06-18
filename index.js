@@ -1,717 +1,313 @@
 /**
- * ============================================================================
- *  YouTube Raw Stream URL Extractor API
- *  -------------------------------------------------------------------------
- *  • Pure original implementation (no yt-dlp / ytdl-core / youtubei.js)
- *  • Node.js built-ins only — ZERO npm dependencies
- *  • Multi-client InnerTube fallback (ANDROID_VR → ANDROID → IOS → WEB → TV)
- *  • Auto visitor_data fetch (sw.js_data)
- *  • Pure-JS signature / n-signature decipher (no vm2)
- *  • yt-dlp compatible "formats" response
- *  • Endpoint: GET /stream/:videoId
- * ============================================================================
+ * YouTube googlevideo Raw Stream URL Extraction API
+ * Endpoint: GET /stream/:videoId  →  全ての再生可能ストリームをJSONで返す
  */
-
 'use strict';
 
-const http   = require('http');
-const https  = require('https');
-const url    = require('url');
-const zlib   = require('zlib');
-const crypto = require('crypto');
-const vm     = require('vm');
+const express = require('express');
+const { request: undiciRequest, Agent, setGlobalDispatcher } = require('undici');
 
-// ---------------------------------------------------------------------------
-//  Global config
-// ---------------------------------------------------------------------------
-const PORT          = process.env.PORT || 3000;
-const DEFAULT_TIMEOUT_MS = 15000;
+setGlobalDispatcher(new Agent({
+  connections: 64,
+  keepAliveTimeout: 30_000,
+  keepAliveMaxTimeout: 60_000,
+  headersTimeout: 20_000,
+  bodyTimeout: 30_000
+}));
 
-// Innertube hard-coded API key (public — same key WEB/ANDROID app uses)
-const INNERTUBE_KEY_WEB     = 'AIzaSyAO_FJ2SlqU8Q4STEHLGCilw_Y9_11qcW8';
-const INNERTUBE_KEY_ANDROID = 'AIzaSyA8eiZmM1FaDVjRy-df2KTyQ_vz_yYM39w';
-const INNERTUBE_KEY_IOS     = 'AIzaSyB-63vPrdThhKuerbB2N_l7Kwwcxj6yUAc';
-const INNERTUBE_KEY_TV      = 'AIzaSyDCU8hByM-4DrUqRUYnGn-3llEO78bcxq8';
+let YTJS = null;
+const sessions = new Map();
 
-// Latest client constants — sourced from yt-dlp master (2026-06)
-const CLIENTS = {
-  ANDROID_VR: {
-    key: INNERTUBE_KEY_ANDROID,
-    requiresPoToken: false,
-    requiresJsPlayer: false,
-    context: {
-      client: {
-        clientName: 'ANDROID_VR',
-        clientVersion: '1.65.10',
-        deviceMake: 'Oculus',
-        deviceModel: 'Quest 3',
-        androidSdkVersion: 32,
-        userAgent: 'com.google.android.apps.youtube.vr.oculus/1.65.10 (Linux; U; Android 12L; eureka-user Build/SQ3A.220605.009.A1) gzip',
-        osName: 'Android',
-        osVersion: '12L',
-        hl: 'en',
-        gl: 'US',
-        utcOffsetMinutes: 0,
-      },
-    },
-    clientNameNum: 28,
-  },
-  ANDROID: {
-    key: INNERTUBE_KEY_ANDROID,
-    requiresPoToken: false,
-    requiresJsPlayer: false,
-    context: {
-      client: {
-        clientName: 'ANDROID',
-        clientVersion: '21.02.35',
-        androidSdkVersion: 30,
-        userAgent: 'com.google.android.youtube/21.02.35 (Linux; U; Android 11) gzip',
-        osName: 'Android',
-        osVersion: '11',
-        hl: 'en',
-        gl: 'US',
-        utcOffsetMinutes: 0,
-      },
-    },
-    clientNameNum: 3,
-  },
-  IOS: {
-    key: INNERTUBE_KEY_IOS,
-    requiresPoToken: false,
-    requiresJsPlayer: false,
-    context: {
-      client: {
-        clientName: 'IOS',
-        clientVersion: '21.02.3',
-        deviceMake: 'Apple',
-        deviceModel: 'iPhone16,2',
-        userAgent: 'com.google.ios.youtube/21.02.3 (iPhone16,2; U; CPU iOS 18_3_2 like Mac OS X;)',
-        osName: 'iPhone',
-        osVersion: '18.3.2.22D82',
-        hl: 'en',
-        gl: 'US',
-        utcOffsetMinutes: 0,
-      },
-    },
-    clientNameNum: 5,
-  },
-  TV_EMBEDDED: {
-    key: INNERTUBE_KEY_TV,
-    requiresPoToken: false,
-    requiresJsPlayer: true,
-    context: {
-      client: {
-        clientName: 'TVHTML5_SIMPLY_EMBEDDED_PLAYER',
-        clientVersion: '2.0',
-        userAgent: 'Mozilla/5.0 (PlayStation; PlayStation 4/12.00) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.0 Safari/605.1.15',
-        hl: 'en',
-        gl: 'US',
-        utcOffsetMinutes: 0,
-      },
-      thirdParty: { embedUrl: 'https://www.youtube.com/' },
-    },
-    clientNameNum: 85,
-  },
-  WEB: {
-    key: INNERTUBE_KEY_WEB,
-    requiresPoToken: true,
-    requiresJsPlayer: true,
-    context: {
-      client: {
-        clientName: 'WEB',
-        clientVersion: '2.20260114.08.00',
-        userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36,gzip(gfe)',
-        hl: 'en',
-        gl: 'US',
-        utcOffsetMinutes: 0,
-      },
-    },
-    clientNameNum: 1,
-  },
-};
-
-// Try order — clients that DO NOT need signature decipher first.
-const CLIENT_TRY_ORDER = ['ANDROID_VR', 'ANDROID', 'IOS', 'TV_EMBEDDED', 'WEB'];
-
-// ---------------------------------------------------------------------------
-//  Tiny HTTPS client (built-in only)
-// ---------------------------------------------------------------------------
-function httpsRequest(targetUrl, opts = {}) {
-  return new Promise((resolve, reject) => {
-    const u = new URL(targetUrl);
-    const reqOpts = {
-      method:   opts.method || 'GET',
-      hostname: u.hostname,
-      port:     u.port || 443,
-      path:     u.pathname + u.search,
-      headers:  Object.assign({
-        'accept':          '*/*',
-        'accept-language': 'en-US,en;q=0.9',
-        'accept-encoding': 'gzip, deflate',
-      }, opts.headers || {}),
-      timeout: opts.timeout || DEFAULT_TIMEOUT_MS,
-    };
-
-    const req = https.request(reqOpts, (res) => {
-      // follow redirects
-      if ([301, 302, 303, 307, 308].includes(res.statusCode) && res.headers.location && opts.followRedirect !== false) {
-        const next = new URL(res.headers.location, targetUrl).toString();
-        res.resume();
-        return resolve(httpsRequest(next, opts));
-      }
-
-      const chunks = [];
-      let stream = res;
-      const enc = (res.headers['content-encoding'] || '').toLowerCase();
-      if (enc.includes('gzip'))    stream = res.pipe(zlib.createGunzip());
-      else if (enc.includes('deflate')) stream = res.pipe(zlib.createInflate());
-      else if (enc.includes('br')) stream = res.pipe(zlib.createBrotliDecompress());
-
-      stream.on('data', (c) => chunks.push(c));
-      stream.on('end',  () => {
-        const buf = Buffer.concat(chunks);
-        resolve({
-          statusCode: res.statusCode,
-          headers:    res.headers,
-          body:       buf.toString('utf8'),
-          rawHeaders: res.rawHeaders,
-        });
-      });
-      stream.on('error', reject);
-    });
-
-    req.on('timeout', () => { req.destroy(new Error('Request timeout')); });
-    req.on('error', reject);
-    if (opts.body) req.write(opts.body);
-    req.end();
-  });
-}
-
-// HEAD/Range probe — verifies a googlevideo URL is actually playable
-function probeStream(streamUrl) {
-  return new Promise((resolve) => {
-    try {
-      const u = new URL(streamUrl);
-      const reqOpts = {
-        method:   'GET',
-        hostname: u.hostname,
-        port:     u.port || 443,
-        path:     u.pathname + u.search,
-        headers: {
-          'range':      'bytes=0-1023',
-          'user-agent': 'com.google.android.apps.youtube.vr.oculus/1.65.10',
-        },
-        timeout: 7000,
-      };
-      const req = https.request(reqOpts, (res) => {
-        const ok = res.statusCode === 200 || res.statusCode === 206;
-        res.resume();
-        resolve({ ok, status: res.statusCode, contentLength: res.headers['content-length'], contentType: res.headers['content-type'] });
-      });
-      req.on('timeout', () => { req.destroy(); resolve({ ok: false, status: 0, error: 'timeout' }); });
-      req.on('error', (e) => resolve({ ok: false, status: 0, error: e.message }));
-      req.end();
-    } catch (e) { resolve({ ok: false, status: 0, error: e.message }); }
-  });
-}
-
-// ---------------------------------------------------------------------------
-//  Visitor data fetcher  (parses /sw.js_data — same as yt-dlp / ytdl-core)
-// ---------------------------------------------------------------------------
-let _visitorDataCache = { value: null, expires: 0 };
-
-async function getVisitorData() {
-  const now = Date.now();
-  if (_visitorDataCache.value && _visitorDataCache.expires > now) return _visitorDataCache.value;
-
-  try {
-    const r = await httpsRequest('https://www.youtube.com/sw.js_data', {
-      headers: { 'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36' },
-    });
-    // Body starts with ")]}'" — strip that and parse JSON
-    let body = r.body.replace(/^\)\]\}'/, '').trim();
-    const data = JSON.parse(body);
-    // visitorData is deeply nested — walk and find
-    const vd = deepFind(data, (v) => typeof v === 'string' && /^Cg[A-Za-z0-9_-]{10,}%3D%3D$/.test(v) || (typeof v === 'string' && v.startsWith('Cg') && v.length > 20 && v.length < 200));
-    if (vd) {
-      _visitorDataCache = { value: vd, expires: now + 6 * 60 * 60 * 1000 };
-      return vd;
-    }
-  } catch (e) { /* ignore */ }
-
-  // Fallback: generate a random one in the format YouTube accepts
-  // visitorData format: "Cg" + base64url(11 random bytes) + "%3D%3D"
-  const rnd = crypto.randomBytes(11).toString('base64').replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
-  const generated = 'Cg' + rnd + '%3D%3D';
-  _visitorDataCache = { value: generated, expires: now + 30 * 60 * 1000 };
-  return generated;
-}
-
-function deepFind(obj, predicate) {
-  if (obj == null) return null;
-  if (predicate(obj)) return obj;
-  if (Array.isArray(obj)) {
-    for (const x of obj) { const r = deepFind(x, predicate); if (r) return r; }
-  } else if (typeof obj === 'object') {
-    for (const k of Object.keys(obj)) { const r = deepFind(obj[k], predicate); if (r) return r; }
+async function loadYTJS() {
+  if (YTJS) return YTJS;
+  const mod = await import('youtubei.js');
+  if (mod.Platform && mod.Platform.shim) {
+    mod.Platform.shim.eval = async (data) => new Function(data.output)();
   }
-  return null;
+  YTJS = mod;
+  return mod;
 }
 
-// ---------------------------------------------------------------------------
-//  InnerTube /player request
-// ---------------------------------------------------------------------------
-async function callPlayer(videoId, clientKey, visitorData) {
-  const c = CLIENTS[clientKey];
-  if (!c) throw new Error('Unknown client: ' + clientKey);
+async function getSession(clientType) {
+  if (sessions.has(clientType)) return sessions.get(clientType);
+  const p = (async () => {
+    const { Innertube } = await loadYTJS();
+    return Innertube.create({
+      client_type: clientType,
+      retrieve_player: true,
+      generate_session_locally: false,
+      enable_session_cache: true
+    });
+  })().catch((err) => { sessions.delete(clientType); throw err; });
+  sessions.set(clientType, p);
+  return p;
+}
 
-  const ctx = JSON.parse(JSON.stringify(c.context));
-  if (visitorData && ctx.client) ctx.client.visitorData = visitorData;
+const CLIENT_PRIORITY = [
+  { key: 'IOS',          label: 'iOS' },
+  { key: 'ANDROID',      label: 'ANDROID' },
+  { key: 'MWEB',         label: 'MWEB' },
+  { key: 'TV',           label: 'TVHTML5' },
+  { key: 'TV_EMBEDDED',  label: 'TVHTML5_SIMPLY_EMBEDDED_PLAYER' },
+  { key: 'WEB_EMBEDDED', label: 'WEB_EMBEDDED_PLAYER' },
+  { key: 'WEB',          label: 'WEB' }
+];
 
-  const payload = {
-    videoId,
-    context: ctx,
-    contentCheckOk: true,
-    racyCheckOk: true,
-    playbackContext: {
-      contentPlaybackContext: {
-        html5Preference: 'HTML5_PREF_WANTS',
-        signatureTimestamp: 19999, // gets overwritten if we have player.js timestamp
+const VIDEO_ID_RE = /^[A-Za-z0-9_-]{11}$/;
+
+function parseExpire(url) {
+  try {
+    const u = new URL(url);
+    const expire = u.searchParams.get('expire');
+    return expire ? parseInt(expire, 10) * 1000 : 0;
+  } catch (_) { return 0; }
+}
+
+function isGooglevideo(url) {
+  return typeof url === 'string' && /\.googlevideo\.com\//.test(url);
+}
+
+async function probeUrl(url, timeoutMs = 6000) {
+  const ac = new AbortController();
+  const t = setTimeout(() => ac.abort(), timeoutMs);
+  try {
+    const res = await undiciRequest(url, {
+      method: 'GET',
+      headers: {
+        'user-agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Mobile/15E148 Safari/604.1',
+        range: 'bytes=0-1',
+        'accept-language': 'en-US,en;q=0.9'
       },
-    },
+      signal: ac.signal,
+      maxRedirections: 3
+    });
+    try { for await (const _ of res.body) { break; } } catch (_) {}
+    return {
+      ok: res.statusCode >= 200 && res.statusCode < 300,
+      status: res.statusCode,
+      contentLength: res.headers['content-length'] ? parseInt(res.headers['content-length'], 10) : null,
+      contentType: res.headers['content-type'] || null
+    };
+  } catch (err) {
+    return { ok: false, status: 0, error: String(err && err.message || err) };
+  } finally { clearTimeout(t); }
+}
+
+function describeFormat(fmt, deciphered) {
+  const out = {
+    itag: fmt.itag,
+    mime_type: fmt.mime_type || null,
+    container: null,
+    codecs: null,
+    bitrate: fmt.bitrate || null,
+    average_bitrate: fmt.average_bitrate || null,
+    width: fmt.width || null,
+    height: fmt.height || null,
+    fps: fmt.fps || null,
+    quality: fmt.quality || null,
+    quality_label: fmt.quality_label || null,
+    audio_quality: fmt.audio_quality || null,
+    audio_sample_rate: fmt.audio_sample_rate || null,
+    audio_channels: fmt.audio_channels || null,
+    has_audio: !!fmt.has_audio,
+    has_video: !!fmt.has_video,
+    is_drc: !!fmt.is_drc,
+    content_length: fmt.content_length || null,
+    approx_duration_ms: fmt.approx_duration_ms || null,
+    last_modified: fmt.last_modified || null,
+    loudness_db: fmt.loudness_db ?? null,
+    language: fmt.language || null,
+    url: deciphered
+  };
+  if (fmt.mime_type) {
+    const m = /^([^;]+);\s*codecs="([^"]+)"/.exec(fmt.mime_type);
+    if (m) {
+      out.container = m[1].split('/')[1] || null;
+      out.codecs = m[2];
+    }
+  }
+  return out;
+}
+
+function extractAllFormats(info, session) {
+  const sd = info.streaming_data;
+  if (!sd) return { combined: [], adaptive: [], hls: null, dash: null };
+
+  const decipherSafe = (fmt) => {
+    try { return fmt.decipher(session.player); }
+    catch (err) { return fmt.url || null; }
   };
 
-  const endpoint = `https://www.youtube.com/youtubei/v1/player?key=${c.key}&prettyPrint=false`;
-  const res = await httpsRequest(endpoint, {
-    method: 'POST',
-    headers: {
-      'content-type':       'application/json',
-      'user-agent':         c.context.client.userAgent,
-      'x-youtube-client-name':    String(c.clientNameNum),
-      'x-youtube-client-version': c.context.client.clientVersion,
-      'origin':             'https://www.youtube.com',
-      'x-goog-visitor-id':  visitorData || '',
-    },
-    body: JSON.stringify(payload),
-    timeout: DEFAULT_TIMEOUT_MS,
+  const combined = (sd.formats || [])
+    .map((f) => describeFormat(f, decipherSafe(f)))
+    .filter((f) => f.url);
+
+  const adaptive = (sd.adaptive_formats || [])
+    .map((f) => describeFormat(f, decipherSafe(f)))
+    .filter((f) => f.url);
+
+  return {
+    combined, adaptive,
+    hls: sd.hls_manifest_url || null,
+    dash: sd.dash_manifest_url || null
+  };
+}
+
+const cache = new Map();
+
+function cacheGet(videoId) {
+  const e = cache.get(videoId);
+  if (!e) return null;
+  if (Date.now() >= e.expiresAt - 30_000) { cache.delete(videoId); return null; }
+  return e.payload;
+}
+
+function cacheSet(videoId, payload) {
+  let soonest = Infinity;
+  const scan = (arr) => arr.forEach((f) => {
+    const e = parseExpire(f.url);
+    if (e && e < soonest) soonest = e;
   });
-
-  if (res.statusCode !== 200) {
-    throw new Error(`InnerTube /player returned HTTP ${res.statusCode} for client ${clientKey}`);
-  }
-  let json;
-  try { json = JSON.parse(res.body); }
-  catch (e) { throw new Error('Failed to parse InnerTube response: ' + e.message); }
-  return json;
+  scan(payload.formats.combined);
+  scan(payload.formats.adaptive);
+  if (!isFinite(soonest)) soonest = Date.now() + 5 * 60_000;
+  cache.set(videoId, { payload, expiresAt: soonest });
 }
 
-// ---------------------------------------------------------------------------
-//  Signature / n-signature decipher (pure-JS, no vm2)
-// ---------------------------------------------------------------------------
-const _playerCache = new Map(); // playerId -> { decipherFn, ncodeFn, sts }
+async function resolveStreams(videoId, opts = {}) {
+  const probe = opts.probe !== false;
+  const attempts = [];
 
-async function fetchPlayer(playerUrl) {
-  if (_playerCache.has(playerUrl)) return _playerCache.get(playerUrl);
-
-  const res = await httpsRequest(playerUrl, {
-    headers: { 'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36' },
-  });
-  if (res.statusCode !== 200) throw new Error('player.js HTTP ' + res.statusCode);
-  const js = res.body;
-
-  // Signature timestamp (sts) — needed to convince WEB client to give un-DRM URLs
-  let sts = 19999;
-  const stsMatch = js.match(/signatureTimestamp[:=](\d+)/);
-  if (stsMatch) sts = parseInt(stsMatch[1], 10);
-
-  // ---- Build a sandboxed function that exposes player.js's helpers ----
-  // We extract the decipher function name + helper object using regex patterns
-  // that have been kept up-to-date with YouTube's obfuscation (2026-06).
-  const decipherFn = extractDecipherFn(js);
-  const ncodeFn    = extractNFn(js);
-
-  const entry = { decipherFn, ncodeFn, sts, playerUrl };
-  _playerCache.set(playerUrl, entry);
-  return entry;
-}
-
-function extractDecipherFn(js) {
-  // Find the top-level decipher function name.
-  // Common patterns: a.set("alr","yes");c&&(c=NAME(decodeURIComponent(c)) ...
-  //                  &&(b=NAME(decodeURIComponent(b)))
-  const patterns = [
-    /\b([a-zA-Z0-9$_]+)\s*=\s*function\(\s*[a-zA-Z]\s*\)\s*\{\s*[a-zA-Z]\s*=\s*[a-zA-Z]\.split\(\s*""\s*\)\s*;[\s\S]+?return [a-zA-Z]\.join\(\s*""\s*\)\s*\}/,
-    /\b([a-zA-Z0-9$_]+)\s*=\s*function\(\s*[a-zA-Z]\s*\)\s*\{\s*[a-zA-Z]\s*=\s*[a-zA-Z]\.split\(\s*[a-zA-Z0-9$_]+\[\d+\]\s*\)\s*;[\s\S]+?return [a-zA-Z]\.join/,
-    /(?:\b|[^a-zA-Z0-9$_])([a-zA-Z0-9$_]{2,})\s*=\s*function\(\s*[a-zA-Z]\s*\)\s*\{\s*[a-zA-Z]\s*=\s*[a-zA-Z]\.split\([^)]*\)\s*;[\s\S]*?return [a-zA-Z]\.join\([^)]*\)\s*\}/,
-  ];
-  let fnName = null;
-  let fnBody = null;
-  for (const p of patterns) {
-    const m = js.match(p);
-    if (m) { fnName = m[1]; fnBody = m[0]; break; }
-  }
-  if (!fnName) {
-    // last-resort: look for "a=a.split("");...return a.join("")"
-    const m2 = js.match(/function\(\s*([a-zA-Z])\s*\)\s*\{\s*\1\s*=\s*\1\.split\(\s*""\s*\)\s*;([\s\S]+?)return\s+\1\.join\(\s*""\s*\)\s*\}/);
-    if (m2) {
-      // anonymous — we can use as-is by wrapping
-      return buildSandbox(`var _decipher = function(${m2[1]}){${m2[1]}=${m2[1]}.split("");${m2[2]}return ${m2[1]}.join("");};`, '_decipher', js);
-    }
-    return null;
-  }
-
-  return buildSandbox(`var _decipher = ${fnName};`, '_decipher', js, fnName);
-}
-
-function extractNFn(js) {
-  // The n-sig transform function is referenced as e.g.  c=NAME(c)  or  d=NAME(d)
-  // Modern pattern often looks like: &&(b=a.get("n"))&&(b=NAME(b),a.set("n",b))
-  const patterns = [
-    /&&\([a-zA-Z]=([a-zA-Z0-9$_]+)\([a-zA-Z]\)/,
-    /\.get\(\s*["']n["']\s*\)\s*\)\s*&&\s*\([a-zA-Z]\s*=\s*([a-zA-Z0-9$_]+)\(/,
-    /[a-zA-Z]\s*=\s*([a-zA-Z0-9$_]+)\(String\([a-zA-Z]\)\)/,
-    /\([a-zA-Z]=([a-zA-Z0-9$_]+)\([a-zA-Z]\),[a-zA-Z]\.set\(["']n["']/,
-  ];
-  let fnName = null;
-  for (const p of patterns) {
-    const m = js.match(p);
-    if (m) { fnName = m[1]; break; }
-  }
-  if (!fnName) return null;
-
-  return buildSandbox(`var _ncode = ${fnName};`, '_ncode', js, fnName);
-}
-
-function buildSandbox(intro, exportName, fullJs, targetFnName) {
-  // Wrap the entire player.js inside a closure and surface only the function we need.
-  // This is heavy but the result is cached per-playerUrl.
-  const wrapped = `
-    (function(){
-      var window = {};
-      var document = { documentElement: {}, location: { href: "" } };
-      var navigator = { userAgent: "" };
-      var location = { href: "" };
-      try {
-        ${fullJs}
-      } catch(e) { /* swallow init errors — we only need the symbol */ }
-      try {
-        ${intro}
-        return ${exportName};
-      } catch(e) {
-        return null;
-      }
-    })();
-  `;
-
-  try {
-    const ctx = { window: {}, console: { log() {}, warn() {}, error() {} } };
-    vm.createContext(ctx);
-    const fn = vm.runInContext(wrapped, ctx, { timeout: 5000 });
-    if (typeof fn === 'function') return fn;
-  } catch (e) { /* try fallback */ }
-
-  // Fallback: rebuild by scraping just the function definitions
-  try {
-    const escaped = targetFnName ? targetFnName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') : null;
-    if (escaped) {
-      const defMatch = fullJs.match(new RegExp(`${escaped}\\s*=\\s*function[\\s\\S]+?\\};`));
-      const helperObjMatch = fullJs.match(/var\s+([a-zA-Z0-9$_]+)\s*=\s*\{[\s\S]+?\};/g) || [];
-      const code = helperObjMatch.join('\n') + '\n' + (defMatch ? defMatch[0] : '');
-      const ctx2 = {};
-      vm.createContext(ctx2);
-      vm.runInContext(code + `;globalThis.__fn = ${targetFnName};`, ctx2, { timeout: 5000 });
-      if (typeof ctx2.__fn === 'function') return ctx2.__fn;
-    }
-  } catch (e) { /* nope */ }
-
-  return null;
-}
-
-function decipherSignatureCipher(sigCipherStr, player) {
-  const params = new URLSearchParams(sigCipherStr);
-  const s   = params.get('s');
-  const sp  = params.get('sp') || 'signature';
-  const u   = params.get('url');
-  if (!s || !u) return null;
-  if (!player || !player.decipherFn) return null;
-  let decoded;
-  try { decoded = player.decipherFn(s); }
-  catch (e) { return null; }
-  const finalUrl = new URL(u);
-  finalUrl.searchParams.set(sp, decoded);
-  return finalUrl.toString();
-}
-
-function applyNSig(streamUrl, player) {
-  if (!player || !player.ncodeFn) return streamUrl;
-  const u = new URL(streamUrl);
-  const n = u.searchParams.get('n');
-  if (!n) return streamUrl;
-  try {
-    const newN = player.ncodeFn(n);
-    if (newN && typeof newN === 'string' && !newN.startsWith('enhanced_except')) {
-      u.searchParams.set('n', newN);
-      return u.toString();
-    }
-  } catch (e) { /* fall through */ }
-  return streamUrl;
-}
-
-async function getPlayerJsUrl(videoId) {
-  // Fetch watch page and extract /s/player/.../base.js path
-  const r = await httpsRequest(`https://www.youtube.com/embed/${videoId}`, {
-    headers: { 'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0.0.0 Safari/537.36' },
-  });
-  const m = r.body.match(/"jsUrl":"([^"]+base\.js)"/) || r.body.match(/\/s\/player\/[^"'\s]+?\/base\.js/);
-  if (!m) return null;
-  const path = m[1] || m[0];
-  return path.startsWith('http') ? path : 'https://www.youtube.com' + path;
-}
-
-// ---------------------------------------------------------------------------
-//  Main extraction logic (multi-client fallback)
-// ---------------------------------------------------------------------------
-async function extractStreams(videoId) {
-  const errors = [];
-  const visitorData = await getVisitorData();
-  let combinedFormats = [];
-  let videoDetails = null;
-  let playabilityStatus = null;
-  let usedClients = [];
-  let hlsManifest = null;
-  let dashManifest = null;
-  let playerJs = null;
-
-  for (const clientKey of CLIENT_TRY_ORDER) {
+  for (const client of CLIENT_PRIORITY) {
+    const attempt = { client: client.key, ok: false };
     try {
-      const data = await callPlayer(videoId, clientKey, visitorData);
-      const ps = data.playabilityStatus || {};
-      playabilityStatus = playabilityStatus || ps;
-      if (ps.status && ps.status !== 'OK') {
-        errors.push(`${clientKey}: ${ps.status} - ${ps.reason || ''}`);
-        // try next client (some restrict by client)
-        if (ps.status === 'LOGIN_REQUIRED' || ps.status === 'UNPLAYABLE' || ps.status === 'ERROR' || ps.status === 'AGE_VERIFICATION_REQUIRED') {
+      const session = await getSession(client.key);
+      const info = await session.getBasicInfo(videoId, client.key);
+
+      const ps = info.playability_status;
+      attempt.playability_status = ps ? { status: ps.status, reason: ps.reason || null } : null;
+
+      if (ps && ps.status && ps.status !== 'OK') {
+        attempt.error = ps.reason || `playability ${ps.status}`;
+        attempts.push(attempt);
+        continue;
+      }
+
+      const formats = extractAllFormats(info, session);
+      const allUrls = [...formats.combined, ...formats.adaptive].filter((f) => isGooglevideo(f.url));
+
+      if (allUrls.length === 0) {
+        attempt.error = 'no googlevideo urls';
+        attempts.push(attempt);
+        continue;
+      }
+
+      if (probe) {
+        const sample = [];
+        if (formats.combined[0]) sample.push(formats.combined[0]);
+        const vSample = formats.adaptive.find((f) => f.has_video && !f.has_audio);
+        const aSample = formats.adaptive.find((f) => f.has_audio && !f.has_video);
+        if (vSample) sample.push(vSample);
+        if (aSample) sample.push(aSample);
+
+        const probes = await Promise.all(sample.map((s) => probeUrl(s.url)));
+        const okCount = probes.filter((p) => p.ok).length;
+        attempt.probe = probes.map((p, i) => ({
+          itag: sample[i].itag, status: p.status, ok: p.ok, content_length: p.contentLength
+        }));
+
+        if (okCount === 0) {
+          attempt.error = 'all probed urls failed';
+          attempts.push(attempt);
           continue;
         }
       }
 
-      videoDetails = videoDetails || data.videoDetails;
+      attempt.ok = true;
+      attempts.push(attempt);
 
-      const sd = data.streamingData;
-      if (!sd) { errors.push(`${clientKey}: no streamingData`); continue; }
-
-      if (sd.hlsManifestUrl && !hlsManifest) hlsManifest = sd.hlsManifestUrl;
-      if (sd.dashManifestUrl && !dashManifest) dashManifest = sd.dashManifestUrl;
-
-      const formats = [].concat(sd.formats || [], sd.adaptiveFormats || []);
-      const cipherFormats = formats.filter(f => f.signatureCipher || f.cipher);
-
-      // Load player.js only when we encounter ciphered formats
-      if (cipherFormats.length > 0 && !playerJs) {
-        try {
-          const playerUrl = await getPlayerJsUrl(videoId);
-          if (playerUrl) playerJs = await fetchPlayer(playerUrl);
-        } catch (e) { errors.push('player.js fetch: ' + e.message); }
-      }
-
-      for (const f of formats) {
-        let finalUrl = f.url || null;
-        if (!finalUrl && (f.signatureCipher || f.cipher)) {
-          finalUrl = decipherSignatureCipher(f.signatureCipher || f.cipher, playerJs);
-        }
-        if (finalUrl && playerJs && finalUrl.includes('&n=')) {
-          finalUrl = applyNSig(finalUrl, playerJs);
-        } else if (finalUrl && playerJs) {
-          // some URLs have ?n=
-          if (finalUrl.includes('?n=') || finalUrl.includes('&n=')) finalUrl = applyNSig(finalUrl, playerJs);
-        }
-        if (!finalUrl) continue;
-
-        // de-dup by itag+client
-        if (combinedFormats.some(x => x.itag === f.itag && x.client === clientKey)) continue;
-
-        combinedFormats.push(buildYtdlpFormat(f, finalUrl, clientKey));
-      }
-      usedClients.push(clientKey);
-
-      // ANDROID_VR + ANDROID together usually give everything — early exit if we have audio + video
-      const hasAudio = combinedFormats.some(x => x.acodec && x.acodec !== 'none');
-      const hasVideo = combinedFormats.some(x => x.vcodec && x.vcodec !== 'none');
-      if (hasAudio && hasVideo && combinedFormats.length >= 10 && usedClients.length >= 2) break;
-
-    } catch (e) {
-      errors.push(`${clientKey}: ${e.message}`);
-    }
-  }
-
-  if (!combinedFormats.length && !hlsManifest && !dashManifest) {
-    throw new Error('No playable streams. Errors: ' + errors.join(' | '));
-  }
-
-  return {
-    videoDetails: videoDetails || {},
-    playabilityStatus,
-    formats:       combinedFormats,
-    hlsManifestUrl:  hlsManifest,
-    dashManifestUrl: dashManifest,
-    usedClients,
-    visitorData,
-    errors,
-  };
-}
-
-function buildYtdlpFormat(f, url, client) {
-  const mime = f.mimeType || '';
-  const mimeMatch = mime.match(/^(audio|video)\/([^;]+)(?:;\s*codecs="([^"]+)")?/);
-  const kind     = mimeMatch ? mimeMatch[1] : null;
-  const container= mimeMatch ? mimeMatch[2] : null;
-  const codecs   = mimeMatch ? (mimeMatch[3] || '') : '';
-  let vcodec = 'none', acodec = 'none';
-  if (codecs) {
-    const parts = codecs.split(',').map(s => s.trim());
-    for (const c of parts) {
-      if (/^(avc1|av01|vp9|vp09|hev1|hvc1|vp8)/i.test(c)) vcodec = c;
-      else if (/^(mp4a|opus|vorbis|ec-3|ac-3)/i.test(c)) acodec = c;
-    }
-    if (kind === 'video' && vcodec === 'none' && parts.length) vcodec = parts[0];
-    if (kind === 'audio' && acodec === 'none' && parts.length) acodec = parts[0];
-  }
-
-  return {
-    itag:           f.itag,
-    url,
-    mimeType:       mime,
-    ext:            container || (kind === 'audio' ? 'm4a' : 'mp4'),
-    container,
-    format_id:      String(f.itag) + (client === 'ANDROID_VR' ? '-vr' : ''),
-    format_note:    f.qualityLabel || f.audioQuality || f.quality || '',
-    width:          f.width  || null,
-    height:         f.height || null,
-    fps:            f.fps    || null,
-    quality:        f.quality,
-    qualityLabel:   f.qualityLabel,
-    bitrate:        f.bitrate || null,
-    averageBitrate: f.averageBitrate || null,
-    tbr:            f.bitrate ? Math.round(f.bitrate / 1000) : null,
-    abr:            (acodec !== 'none' && f.averageBitrate) ? Math.round(f.averageBitrate / 1000) : null,
-    vbr:            (vcodec !== 'none' && f.averageBitrate) ? Math.round(f.averageBitrate / 1000) : null,
-    contentLength:  f.contentLength ? String(f.contentLength) : null,
-    filesize:       f.contentLength ? Number(f.contentLength) : null,
-    approxDurationMs: f.approxDurationMs,
-    audioChannels:  f.audioChannels || null,
-    audioSampleRate:f.audioSampleRate || null,
-    audioQuality:   f.audioQuality || null,
-    loudnessDb:     f.loudnessDb || null,
-    vcodec, acodec,
-    protocol:       (mime.includes('mp4') ? 'https' : 'https'),
-    client,
-    hasVideo:       vcodec !== 'none',
-    hasAudio:       acodec !== 'none',
-    isAdaptive:     !(vcodec !== 'none' && acodec !== 'none'),
-    initRange:      f.initRange || null,
-    indexRange:     f.indexRange || null,
-    colorInfo:      f.colorInfo || null,
-    projectionType: f.projectionType || null,
-    stereoLayout:   f.stereoLayout || null,
-  };
-}
-
-// ---------------------------------------------------------------------------
-//  HTTP server
-// ---------------------------------------------------------------------------
-const server = http.createServer(async (req, res) => {
-  const parsed = url.parse(req.url, true);
-  const path   = parsed.pathname;
-
-  res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader('Cache-Control', 'no-store');
-
-  if (path === '/' || path === '/health') {
-    res.writeHead(200, { 'Content-Type': 'application/json' });
-    return res.end(JSON.stringify({
-      name: 'yt-stream-api',
-      ok: true,
-      endpoints: {
-        stream: '/stream/:videoId',
-        probe:  '/probe/:videoId',
-      },
-      version: '1.0.0',
-      uptime: process.uptime(),
-    }, null, 2));
-  }
-
-  // /stream/:videoId  -> yt-dlp compatible JSON
-  const streamMatch = path.match(/^\/stream\/([A-Za-z0-9_-]{11})$/);
-  if (streamMatch) {
-    const videoId = streamMatch[1];
-    const wantProbe = parsed.query.probe === '1' || parsed.query.probe === 'true';
-    try {
-      const t0 = Date.now();
-      const r  = await extractStreams(videoId);
-      let probes = null;
-      if (wantProbe) {
-        probes = await Promise.all(r.formats.slice(0, 3).map(async f => ({ itag: f.itag, ...(await probeStream(f.url)) })));
-      }
-      const elapsed = Date.now() - t0;
-      res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
-      return res.end(JSON.stringify({
+      const details = info.basic_info || {};
+      return {
         ok: true,
-        elapsedMs: elapsed,
-        videoId,
-        title:    r.videoDetails.title,
-        author:   r.videoDetails.author,
-        channelId:r.videoDetails.channelId,
-        lengthSeconds: r.videoDetails.lengthSeconds ? Number(r.videoDetails.lengthSeconds) : null,
-        viewCount:r.videoDetails.viewCount,
-        isLive:   !!r.videoDetails.isLiveContent,
-        thumbnails: (r.videoDetails.thumbnail && r.videoDetails.thumbnail.thumbnails) || [],
-        playabilityStatus: r.playabilityStatus,
-        formats:  r.formats,
-        hlsManifestUrl:  r.hlsManifestUrl || null,
-        dashManifestUrl: r.dashManifestUrl || null,
-        usedClients: r.usedClients,
-        visitorData: r.visitorData,
-        probes,
-        warnings: r.errors,
-      }, null, 2));
-    } catch (e) {
-      res.writeHead(500, { 'Content-Type': 'application/json' });
-      return res.end(JSON.stringify({ ok: false, error: e.message, stack: e.stack }));
+        video_id: videoId,
+        client_used: client.key,
+        title: details.title || null,
+        author: details.author || null,
+        channel_id: details.channel_id || null,
+        duration: details.duration || null,
+        view_count: details.view_count || null,
+        is_live: !!details.is_live,
+        is_upcoming: !!details.is_upcoming,
+        thumbnails: details.thumbnail || [],
+        formats: {
+          combined: formats.combined,
+          adaptive: formats.adaptive,
+          hls_manifest_url: formats.hls,
+          dash_manifest_url: formats.dash
+        },
+        attempts
+      };
+    } catch (err) {
+      attempt.error = String(err && (err.message || err.info) || err);
+      attempts.push(attempt);
     }
   }
 
-  // /probe/:videoId — quick HEAD/Range check of best format
-  const probeMatch = path.match(/^\/probe\/([A-Za-z0-9_-]{11})$/);
-  if (probeMatch) {
-    const videoId = probeMatch[1];
-    try {
-      const r = await extractStreams(videoId);
-      const sample = r.formats.slice(0, 5);
-      const probes = await Promise.all(sample.map(async f => ({ itag: f.itag, mimeType: f.mimeType, ...(await probeStream(f.url)) })));
-      res.writeHead(200, { 'Content-Type': 'application/json' });
-      return res.end(JSON.stringify({ ok: true, videoId, probes, usedClients: r.usedClients }, null, 2));
-    } catch (e) {
-      res.writeHead(500, { 'Content-Type': 'application/json' });
-      return res.end(JSON.stringify({ ok: false, error: e.message }));
-    }
-  }
+  return { ok: false, video_id: videoId, error: 'All InnerTube clients failed to return playable streams', attempts };
+}
 
-  res.writeHead(404, { 'Content-Type': 'application/json' });
-  res.end(JSON.stringify({ ok: false, error: 'Not Found' }));
+const app = express();
+app.disable('x-powered-by');
+app.set('etag', false);
+
+app.use((req, res, next) => {
+  res.setHeader('access-control-allow-origin', '*');
+  res.setHeader('access-control-allow-methods', 'GET, OPTIONS');
+  res.setHeader('access-control-allow-headers', 'content-type');
+  if (req.method === 'OPTIONS') return res.status(204).end();
+  next();
 });
 
-// On Vercel/serverless, do not start a long-running listener — export the handler.
-const isServerless = !!(process.env.VERCEL || process.env.AWS_LAMBDA_FUNCTION_NAME || process.env.NETLIFY);
-if (!isServerless && require.main === module) {
-  server.listen(PORT, () => {
-    console.log(`[yt-stream-api] listening on :${PORT}`);
+app.get('/', (_req, res) => {
+  res.json({
+    name: 'yt-stream-api',
+    version: '1.0.0',
+    endpoints: { stream: '/stream/:videoId', health: '/health' },
+    notes: 'GET /stream/<11-char-videoId>?probe=0 to skip URL probing.'
+  });
+});
+
+app.get('/health', (_req, res) => res.json({ ok: true, uptime: process.uptime() }));
+
+app.get('/stream/:videoId', async (req, res) => {
+  const { videoId } = req.params;
+  if (!VIDEO_ID_RE.test(videoId)) {
+    return res.status(400).json({ ok: false, error: 'invalid videoId (must be 11 chars [A-Za-z0-9_-])' });
+  }
+  const probe = req.query.probe !== '0' && req.query.probe !== 'false';
+  const noCache = req.query.nocache === '1' || req.query.nocache === 'true';
+
+  if (!noCache) {
+    const hit = cacheGet(videoId);
+    if (hit) return res.json({ ...hit, cached: true });
+  }
+
+  try {
+    const out = await resolveStreams(videoId, { probe });
+    if (out.ok && !noCache) cacheSet(videoId, out);
+    res.status(out.ok ? 200 : 502).json({ ...out, cached: false });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: String(err && err.message || err) });
+  }
+});
+
+const PORT = parseInt(process.env.PORT, 10) || 3000;
+const HOST = process.env.HOST || '0.0.0.0';
+
+if (require.main === module) {
+  app.listen(PORT, HOST, () => {
+    console.log(`[yt-stream-api] listening on http://${HOST}:${PORT}`);
   });
 }
 
-// Vercel handler signature: (req, res) => …
-module.exports = server;
-module.exports.default = server;
-module.exports.extractStreams = extractStreams;
-module.exports.probeStream    = probeStream;
-module.exports.getVisitorData = getVisitorData;
-module.exports.callPlayer     = callPlayer;
+module.exports = app;
